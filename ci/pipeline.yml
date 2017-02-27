@@ -1,0 +1,151 @@
+---
+meta:
+  name:  (( grab $PIPELINE ))
+  vault: (( concat "secret/ci/" meta.github.user "/" meta.github.repo ))
+  github:
+    user:   homeports
+    repo:   toy
+    branch: master
+
+  task:
+    platform: linux
+    image_resource:
+      type: docker-image
+      source:
+        repository: starkandwayne/concourse
+        tag: latest
+
+groups:
+  - name: (( grab meta.name ))
+    jobs:
+      - major
+      - minor
+      - patch
+      - test
+      - rc
+      - ship
+
+resources:
+  - name: code
+    type: git
+    source:
+      uri:         (( concat "git@github.com:" meta.github.user "/" meta.github.repo ))
+      branch:      (( grab meta.github.branch ))
+      private_key: (( vault meta.vault "/deploy:private" ))
+
+  - name: github
+    type: github-release
+    source:
+      user:         (( grab meta.github.user ))
+      repository:   (( grab meta.github.repo ))
+      access_token: (( vault meta.vault "/deploy:token" ))
+
+  - name: version
+    type: semver
+    source:
+      driver:      git
+      uri:         (( concat "git@github.com:" meta.github.user "/" meta.github.repo ))
+      private_key: (( vault meta.vault "/deploy:private" ))
+      branch:      version
+      file:        version
+
+jobs:
+  - name: major
+    public: true
+    serial: true
+    plan:
+      - get: version
+      - put: version
+        params: { bump: major }
+
+  - name: minor
+    public: true
+    serial: true
+    plan:
+      - get: version
+      - put: version
+        params: {bump: minor}
+
+  - name: patch
+    public: true
+    serial: true
+    plan:
+        # bump rc + patch, so that subesquent version bumps can trigger a new 'patch' run
+      - { get: version, trigger: true, params: { bump: patch, pre: rc }, passed: [ship] }
+      - { put: version,                params: { file: version/number} }
+
+  - name: test
+    public: true
+    serial: true
+    plan:
+      - { get: code, trigger: true }
+
+      - task: test
+        config:
+          .: (( inject meta.task ))
+          inputs:
+            - name: code
+          run:
+            path: code/ci/run
+            args: [test]
+          params:
+            CODE_IS_AT: code/
+
+  - name: rc
+    public: true
+    serial: true
+    plan:
+      - aggregate:
+        - { get: code,    trigger: true, passed: [test] }
+        - { get: version, trigger: true, params: {pre: rc} }
+
+      - task: check-release-notes
+        config:
+          .: (( inject meta.task ))
+          inputs:
+            - name: code
+            - name: version
+          run:
+            path: code/ci/run
+            args: [rc]
+          params:
+            CODE_IS_AT:    code/
+            VERSION_IS_AT: version/
+
+      - { put: version, params: {file: version/number} }
+
+  - name: ship
+    public: true
+    serial: true
+    plan:
+      - aggregate:
+        - { get: code,    trigger: true, passed: [rc] }
+        - { get: version, trigger: true, passed: [rc], params: {bump: final} }
+
+      - task: ship
+        config:
+          .: (( inject meta.task ))
+          inputs:
+            - name: code
+            - name: version
+          outputs:
+            - name: out
+          run:
+            path: code/ci/run
+            args: [ship]
+          params:
+            CODE_IS_AT:    code/
+            VERSION_IS_AT: version/
+            OUTPUT_IS_AT:  out/
+
+      - put: code
+        params:
+          rebase: true
+          repository: out/code
+
+      - put: github
+        params:
+          name:   out/release/name
+          tag:    out/release/tag
+          body:   out/release/notes.md
+          globs: [out/release/artifacts/*]

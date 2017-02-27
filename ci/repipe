@@ -1,0 +1,9 @@
+#!/bin/bash
+set -e
+
+export PIPELINE=toy
+spruce merge --prune meta ci/pipeline.yml > ci/deploy.yml
+trap 'rm -f ci/deploy.yml' EXIT INT QUIT TERM
+
+fly -t nifty set-pipeline -p $PIPELINE -c ci/deploy.yml
+fly -t nifty expose-pipeline -p $PIPELINE
